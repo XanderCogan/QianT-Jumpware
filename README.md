@@ -44,4 +44,3 @@ A Chrome MV3 extension that lets you quickly jump to your Google Docs and GitHub
 ## License
 
 MIT
-
