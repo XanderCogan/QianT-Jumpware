@@ -1,0 +1,10 @@
+{
+  "manifest_version": 3,
+  "name": "GoTo (Docs + GitHub)",
+  "version": "0.1.0",
+  "description": "Type ; then a name to jump to your Google Docs or GitHub repos.",
+  "omnibox": { "keyword": ";" },
+  "permissions": ["history", "bookmarks", "storage"],
+  "background": { "type": "module", "service_worker": "background.js" }
+}
+
