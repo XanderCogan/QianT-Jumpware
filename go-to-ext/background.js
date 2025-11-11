@@ -13,12 +13,14 @@ const fuzzyScore = (q, t) => {
 // --- restrict to Docs + GitHub only ---
 const HOST_ALLOW = /(^|\.)docs\.google\.com$|(^|\.)github\.com$/i;
 
-const normalizeItem = (url, title = "") => {
+const normalizeItem = (url, title = "", extractedContent = null) => {
   try {
     const u = new URL(url);
     if (!HOST_ALLOW.test(u.hostname)) return null;
 
-    let label = title || url;
+    // Use extracted title if available, otherwise use provided title
+    const finalTitle = extractedContent?.title || title || url;
+    let label = finalTitle;
     let kind = "Other";
 
     if (/docs\.google\.com/i.test(u.hostname)) {
@@ -28,14 +30,22 @@ const normalizeItem = (url, title = "") => {
       else kind = "Google Docs";
 
       // Fall back to a human-ish ID if no title
-      label = title && title.trim() ? title : `[${kind}] ${u.pathname.split("/")[3] || ""}`;
+      label = finalTitle && finalTitle.trim() ? finalTitle : `[${kind}] ${u.pathname.split("/")[3] || ""}`;
     } else if (/github\.com/i.test(u.hostname)) {
       const [, owner, repo] = u.pathname.split("/");
-      if (owner && repo) { kind = "GitHub"; label = title && title.trim() ? title : `${owner}/${repo}`; }
+      if (owner && repo) { kind = "GitHub"; label = finalTitle && finalTitle.trim() ? finalTitle : `${owner}/${repo}`; }
       else kind = "GitHub";
     }
 
-    return { url: u.toString(), title: label, host: u.hostname, kind };
+    return { 
+      url: u.toString(), 
+      title: label, 
+      host: u.hostname, 
+      kind,
+      content: extractedContent?.content || '',
+      headings: extractedContent?.headings || '',
+      extractedAt: extractedContent?.extractedAt || null
+    };
   } catch { return null; }
 };
 
@@ -83,27 +93,222 @@ chrome.history.onVisited.addListener(async () => {
   if (!index_timestamp || (Date.now() - index_timestamp) > 60 * 1000) buildIndex();
 });
 
+// --- Extract content from a tab ---
+async function extractContentFromTab(tabId) {
+  try {
+    const response = await chrome.tabs.sendMessage(tabId, { action: 'extractPageContent' });
+    if (response && response.success) {
+      return response.data;
+    }
+  } catch (e) {
+    // Content script might not be available
+    console.log('[Jumpware] Could not extract page content:', e.message);
+  }
+  return null;
+}
+
+// --- Cache for on-screen links and OTP detection ---
+let screenSnapshot = {
+  links: [],
+  otpGmailUrl: null,
+  tabId: null,
+  timestamp: 0
+};
+
+const SNAPSHOT_TTL = 15000; // 15 seconds
+
+// --- Check and request host permissions if needed ---
+async function ensureHostPermissions() {
+  try {
+    const hasPermissions = await chrome.permissions.contains({ origins: ['<all_urls>'] });
+    if (!hasPermissions) {
+      // Request permissions on first use
+      const granted = await chrome.permissions.request({ origins: ['<all_urls>'] });
+      return granted;
+    }
+    return true;
+  } catch (error) {
+    console.log('[Jumpware] Error checking permissions:', error);
+    return false;
+  }
+}
+
+// --- Request screen snapshot from active tab ---
+async function requestScreenSnapshot() {
+  try {
+    // Check permissions first (graceful degradation if denied)
+    const hasPermissions = await ensureHostPermissions();
+    if (!hasPermissions) {
+      return null; // Silently degrade - Docs/GitHub suggestions still work
+    }
+
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab || !tab.id) return null;
+
+    // Check if we have a fresh snapshot for this tab
+    if (screenSnapshot.tabId === tab.id && 
+        (Date.now() - screenSnapshot.timestamp) < SNAPSHOT_TTL) {
+      return screenSnapshot;
+    }
+
+    // Request visible links
+    let links = [];
+    try {
+      const linksResponse = await chrome.tabs.sendMessage(tab.id, { action: 'collectVisibleLinks' });
+      if (linksResponse && linksResponse.success) {
+        links = linksResponse.links || [];
+      }
+    } catch (e) {
+      // Content script might not be available (e.g., chrome:// pages)
+      console.log('[Jumpware] Could not collect visible links:', e.message);
+    }
+
+    // Request OTP detection
+    let otpGmailUrl = null;
+    try {
+      const otpResponse = await chrome.tabs.sendMessage(tab.id, { action: 'detectOTPScreen' });
+      if (otpResponse && otpResponse.success && otpResponse.detected) {
+        otpGmailUrl = otpResponse.gmailUrl;
+      }
+    } catch (e) {
+      console.log('[Jumpware] Could not detect OTP screen:', e.message);
+    }
+
+    // Update snapshot
+    screenSnapshot = {
+      links,
+      otpGmailUrl,
+      tabId: tab.id,
+      timestamp: Date.now()
+    };
+
+    return screenSnapshot;
+  } catch (error) {
+    console.log('[Jumpware] Error requesting screen snapshot:', error);
+    return null;
+  }
+}
+
+// --- Clear snapshot on tab change ---
+chrome.tabs.onActivated.addListener(() => {
+  screenSnapshot = { links: [], otpGmailUrl: null, tabId: null, timestamp: 0 };
+});
+
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+  if (changeInfo.url || changeInfo.status === 'loading') {
+    if (screenSnapshot.tabId === tabId) {
+      screenSnapshot = { links: [], otpGmailUrl: null, tabId: null, timestamp: 0 };
+    }
+  }
+  
+  // Extract content when page is fully loaded
+  if (changeInfo.status === 'complete' && tab.url) {
+    try {
+      const u = new URL(tab.url);
+      if (HOST_ALLOW.test(u.hostname)) {
+        // Extract content with a small delay to ensure page is fully rendered
+        setTimeout(async () => {
+          const content = await extractContentFromTab(tabId);
+          if (content) {
+            // Update index with extracted content
+            let { index } = await chrome.storage.local.get('index');
+            // Initialize index if it doesn't exist
+            if (!index) {
+              index = await buildIndex();
+            }
+            if (index) {
+              const itemIndex = index.findIndex(item => item.url === tab.url);
+              if (itemIndex >= 0) {
+                // Update existing item
+                index[itemIndex].content = content.content || '';
+                index[itemIndex].headings = content.headings || '';
+                if (content.title && content.title.trim() && content.title !== 'Untitled document') {
+                  index[itemIndex].title = content.title.trim();
+                }
+                index[itemIndex].extractedAt = content.extractedAt;
+                await chrome.storage.local.set({ index });
+              } else {
+                // Add new item
+                const newItem = normalizeItem(tab.url, tab.title || '', content);
+                if (newItem) {
+                  index.push(newItem);
+                  await chrome.storage.local.set({ index });
+                }
+              }
+            }
+          }
+        }, 1000); // Wait 1 second for page to fully render
+      }
+    } catch (e) {
+      // Ignore errors (e.g., invalid URLs)
+      console.log('[Jumpware] Error processing tab update:', e.message);
+    }
+  }
+});
+
 // --- omnibox wiring ---
-chrome.omnibox.onInputStarted.addListener(() => {
+chrome.omnibox.onInputStarted.addListener(async () => {
+  // Request fresh snapshot when omnibox opens
+  await requestScreenSnapshot();
+  
   chrome.omnibox.setDefaultSuggestion({
     description: "Type a doc/repo name (e.g., ; proposal draft  ·  ; owner/repo)"
   });
 });
 
 chrome.omnibox.onInputChanged.addListener(async (text, suggest) => {
+  // Get fresh snapshot if needed
+  const snapshot = await requestScreenSnapshot();
+  
+  const suggestions = [];
+  const q = text.trim().toLowerCase();
+
+  // 1. OTP Gmail suggestion (highest priority if detected)
+  // Always show as first suggestion when OTP screen is detected
+  if (snapshot && snapshot.otpGmailUrl) {
+    suggestions.push({
+      content: snapshot.otpGmailUrl,
+      description: `Open Gmail: verification code — <url>${escapeForOmnibox(snapshot.otpGmailUrl)}</url>`
+    });
+  }
+
+  // 2. On-screen links
+  if (snapshot && snapshot.links && snapshot.links.length > 0) {
+    for (const link of snapshot.links) {
+      // Filter by query if provided
+      if (!q || link.text.toLowerCase().includes(q) || link.url.toLowerCase().includes(q)) {
+        suggestions.push({
+          content: link.url,
+          description: `Open link on screen: ${escapeForOmnibox(link.text)} — <url>${escapeForOmnibox(link.url)}</url>`
+        });
+      }
+    }
+  }
+
+  // 3. Docs/GitHub suggestions
   const idx = await getIndexFresh();
-  const q = text.trim();
   const scored = idx.map(item => {
-    const hay = `${item.title} ${item.url} ${item.kind}`;
+    // Include content in search
+    const hay = `${item.title} ${item.url} ${item.kind} ${item.content || ''} ${item.headings || ''}`;
     return { item, score: fuzzyScore(q, hay) };
   }).filter(x => x.score !== -Infinity);
 
   scored.sort((a, b) => b.score - a.score);
 
-  suggest(scored.slice(0, 6).map(({ item }) => ({
-    content: item.url,
-    description: `${item.kind}: ${escapeForOmnibox(item.title)} — <url>${escapeForOmnibox(item.url)}</url>`
-  })));
+  // Add Docs/GitHub suggestions, maintaining max 6 total
+  const maxSuggestions = 6;
+  const remainingSlots = maxSuggestions - suggestions.length;
+  
+  if (remainingSlots > 0) {
+    const docsGithubSuggestions = scored.slice(0, remainingSlots).map(({ item }) => ({
+      content: item.url,
+      description: `${item.kind}: ${escapeForOmnibox(item.title)} — <url>${escapeForOmnibox(item.url)}</url>`
+    }));
+    suggestions.push(...docsGithubSuggestions);
+  }
+
+  // Limit to max 6 suggestions
+  suggest(suggestions.slice(0, maxSuggestions));
 });
 
 // open picked suggestion (or fall back to web search if user typed a raw string)
@@ -114,20 +319,40 @@ chrome.omnibox.onInputEntered.addListener(async (text, disposition) => {
   if (/^https?:\/\//i.test(text)) {
     url = text;
   } else {
-    // Otherwise, compute suggestions and use the first match
-    const idx = await getIndexFresh();
-    const q = text.trim();
-    const scored = idx.map(item => {
-      const hay = `${item.title} ${item.url} ${item.kind}`;
-      return { item, score: fuzzyScore(q, hay) };
-    }).filter(x => x.score !== -Infinity);
-
-    scored.sort((a, b) => b.score - a.score);
+    // Get fresh snapshot to check for OTP Gmail or on-screen links
+    const snapshot = await requestScreenSnapshot();
+    const q = text.trim().toLowerCase();
     
-    // Use first suggestion if available, otherwise fall back to Google search
-    url = scored.length > 0 
-      ? scored[0].item.url 
-      : `https://www.google.com/search?q=${encodeURIComponent(text)}`;
+    // Priority 1: OTP Gmail (if detected, always prioritize when Enter is pressed)
+    if (snapshot && snapshot.otpGmailUrl) {
+      url = snapshot.otpGmailUrl;
+    }
+    // Priority 2: On-screen links (if query matches)
+    else if (snapshot && snapshot.links && snapshot.links.length > 0) {
+      const matchingLink = snapshot.links.find(link => 
+        !q || link.text.toLowerCase().includes(q) || link.url.toLowerCase().includes(q)
+      );
+      if (matchingLink) {
+        url = matchingLink.url;
+      }
+    }
+    
+    // Priority 3: Docs/GitHub suggestions
+    if (!url) {
+      const idx = await getIndexFresh();
+      const scored = idx.map(item => {
+        // Include content in search
+        const hay = `${item.title} ${item.url} ${item.kind} ${item.content || ''} ${item.headings || ''}`;
+        return { item, score: fuzzyScore(q, hay) };
+      }).filter(x => x.score !== -Infinity);
+
+      scored.sort((a, b) => b.score - a.score);
+      
+      // Use first suggestion if available, otherwise fall back to Google search
+      url = scored.length > 0 
+        ? scored[0].item.url 
+        : `https://www.google.com/search?q=${encodeURIComponent(text)}`;
+    }
   }
 
   if (disposition === "currentTab") chrome.tabs.update({ url });
