@@ -55,6 +55,11 @@ const dedupeByUrl = (arr) => {
   return out;
 };
 
+// --- In-memory index cache for fast access ---
+let indexCache = null;
+let indexCacheTimestamp = 0;
+const INDEX_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
 // --- build + cache index in chrome.storage.local ---
 async function buildIndex() {
   const [hist, tree] = await Promise.all([
@@ -75,22 +80,50 @@ async function buildIndex() {
   tree.forEach(walk);
 
   const index = dedupeByUrl([...fromBookmarks, ...fromHistory]);
-  await chrome.storage.local.set({ index, index_timestamp: Date.now() });
+  const timestamp = Date.now();
+  await chrome.storage.local.set({ index, index_timestamp: timestamp });
+  // Update in-memory cache
+  indexCache = index;
+  indexCacheTimestamp = timestamp;
   return index;
 }
 
-async function getIndexFresh() {
+// Load index into memory on startup
+async function loadIndexToMemory() {
   const { index, index_timestamp } = await chrome.storage.local.get(["index", "index_timestamp"]);
-  if (!index || !index_timestamp || (Date.now() - index_timestamp) > 5 * 60 * 1000) {
-    return await buildIndex();
+  if (index) {
+    indexCache = index;
+    indexCacheTimestamp = index_timestamp || Date.now();
+  } else {
+    indexCache = await buildIndex();
+    indexCacheTimestamp = Date.now();
   }
-  return index;
+}
+
+// Fast in-memory index getter (no async I/O if cache is fresh)
+async function getIndexFast() {
+  // If cache is fresh, return immediately (no async I/O!)
+  if (indexCache && (Date.now() - indexCacheTimestamp) < INDEX_CACHE_TTL) {
+    return indexCache;
+  }
+  // Otherwise refresh
+  indexCache = await buildIndex();
+  indexCacheTimestamp = Date.now();
+  return indexCache;
+}
+
+// Legacy function for compatibility
+async function getIndexFresh() {
+  return await getIndexFast();
 }
 
 // refresh periodically as you browse (rate-limited)
 chrome.history.onVisited.addListener(async () => {
   const { index_timestamp } = await chrome.storage.local.get("index_timestamp");
-  if (!index_timestamp || (Date.now() - index_timestamp) > 60 * 1000) buildIndex();
+  if (!index_timestamp || (Date.now() - index_timestamp) > 60 * 1000) {
+    // buildIndex() already updates indexCache, so this is fine
+    await buildIndex();
+  }
 });
 
 // --- Extract content from a tab ---
@@ -194,6 +227,42 @@ chrome.tabs.onActivated.addListener(() => {
   screenSnapshot = { links: [], otpGmailUrl: null, tabId: null, timestamp: 0 };
 });
 
+// Extract content asynchronously without blocking
+async function extractContentAsync(tabId, url) {
+  const content = await extractContentFromTab(tabId);
+  if (content) {
+    // Ensure index is loaded
+    if (!indexCache) {
+      await loadIndexToMemory();
+    }
+    
+    if (indexCache) {
+      // Update in-memory cache immediately (fast!)
+      const itemIndex = indexCache.findIndex(item => item.url === url);
+      if (itemIndex >= 0) {
+        indexCache[itemIndex].content = content.content || '';
+        indexCache[itemIndex].headings = content.headings || '';
+        if (content.title && content.title.trim() && content.title !== 'Untitled document') {
+          indexCache[itemIndex].title = content.title.trim();
+        }
+        indexCache[itemIndex].extractedAt = content.extractedAt;
+      } else {
+        // Add new item
+        const newItem = normalizeItem(url, '', content);
+        if (newItem) {
+          indexCache.push(newItem);
+        }
+      }
+      
+      // Persist to storage in background (don't await - non-blocking)
+      chrome.storage.local.set({ 
+        index: indexCache, 
+        index_timestamp: Date.now() 
+      }).catch(e => console.log('[Jumpware] Error saving index:', e));
+    }
+  }
+}
+
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   if (changeInfo.url || changeInfo.status === 'loading') {
     if (screenSnapshot.tabId === tabId) {
@@ -206,38 +275,8 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
     try {
       const u = new URL(tab.url);
       if (HOST_ALLOW.test(u.hostname)) {
-        // Extract content with a small delay to ensure page is fully rendered
-        setTimeout(async () => {
-          const content = await extractContentFromTab(tabId);
-          if (content) {
-            // Update index with extracted content
-            let { index } = await chrome.storage.local.get('index');
-            // Initialize index if it doesn't exist
-            if (!index) {
-              index = await buildIndex();
-            }
-            if (index) {
-              const itemIndex = index.findIndex(item => item.url === tab.url);
-              if (itemIndex >= 0) {
-                // Update existing item
-                index[itemIndex].content = content.content || '';
-                index[itemIndex].headings = content.headings || '';
-                if (content.title && content.title.trim() && content.title !== 'Untitled document') {
-                  index[itemIndex].title = content.title.trim();
-                }
-                index[itemIndex].extractedAt = content.extractedAt;
-                await chrome.storage.local.set({ index });
-              } else {
-                // Add new item
-                const newItem = normalizeItem(tab.url, tab.title || '', content);
-                if (newItem) {
-                  index.push(newItem);
-                  await chrome.storage.local.set({ index });
-                }
-              }
-            }
-          }
-        }, 1000); // Wait 1 second for page to fully render
+        // Reduced delay - extract after minimal wait for page render
+        setTimeout(() => extractContentAsync(tabId, tab.url), 200);
       }
     } catch (e) {
       // Ignore errors (e.g., invalid URLs)
@@ -257,8 +296,9 @@ chrome.omnibox.onInputStarted.addListener(async () => {
 });
 
 chrome.omnibox.onInputChanged.addListener(async (text, suggest) => {
-  // Get fresh snapshot if needed
-  const snapshot = await requestScreenSnapshot();
+  // Use cached snapshot - don't request new one on every keystroke!
+  // This avoids slow IPC calls to content scripts on every keystroke
+  const snapshot = screenSnapshot.tabId ? screenSnapshot : null;
   
   const suggestions = [];
   const q = text.trim().toLowerCase();
@@ -286,10 +326,23 @@ chrome.omnibox.onInputChanged.addListener(async (text, suggest) => {
   }
 
   // 3. Docs/GitHub suggestions
-  const idx = await getIndexFresh();
-  const scored = idx.map(item => {
-    // Include content in search
-    const hay = `${item.title} ${item.url} ${item.kind} ${item.content || ''} ${item.headings || ''}`;
+  const idx = await getIndexFast(); // Use fast in-memory cache
+  
+  // Quick pre-filter: only fuzzy score items that might match
+  // This eliminates most items before expensive fuzzy matching
+  const quickFilter = q.length > 0 
+    ? idx.filter(item => {
+        const searchable = `${item.title} ${item.url}`.toLowerCase();
+        return searchable.includes(q[0]); // At least first char must match
+      })
+    : idx;
+  
+  // Only include full content in search for longer queries (3+ chars)
+  // For short queries, just search title/url/kind for speed
+  const scored = quickFilter.map(item => {
+    const hay = q.length >= 3 
+      ? `${item.title} ${item.url} ${item.kind} ${item.content || ''} ${item.headings || ''}`
+      : `${item.title} ${item.url} ${item.kind}`;
     return { item, score: fuzzyScore(q, hay) };
   }).filter(x => x.score !== -Infinity);
 
@@ -339,10 +392,21 @@ chrome.omnibox.onInputEntered.addListener(async (text, disposition) => {
     
     // Priority 3: Docs/GitHub suggestions
     if (!url) {
-      const idx = await getIndexFresh();
-      const scored = idx.map(item => {
-        // Include content in search
-        const hay = `${item.title} ${item.url} ${item.kind} ${item.content || ''} ${item.headings || ''}`;
+      const idx = await getIndexFast(); // Use fast in-memory cache
+      
+      // Pre-filter for performance
+      const quickFilter = q.length > 0 
+        ? idx.filter(item => {
+            const searchable = `${item.title} ${item.url}`.toLowerCase();
+            return searchable.includes(q[0]);
+          })
+        : idx;
+      
+      const scored = quickFilter.map(item => {
+        // Include content for longer queries
+        const hay = q.length >= 3 
+          ? `${item.title} ${item.url} ${item.kind} ${item.content || ''} ${item.headings || ''}`
+          : `${item.title} ${item.url} ${item.kind}`;
         return { item, score: fuzzyScore(q, hay) };
       }).filter(x => x.score !== -Infinity);
 
@@ -368,6 +432,6 @@ function escapeForOmnibox(s) {
     .replaceAll(">", "&gt;");
 }
 
-// build initial index on install/activate
-buildIndex();
+// build initial index on install/activate and load into memory
+loadIndexToMemory();
 
