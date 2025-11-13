@@ -13,6 +13,39 @@ const fuzzyScore = (q, t) => {
 // --- restrict to Docs + GitHub only ---
 const HOST_ALLOW = /(^|\.)docs\.google\.com$|(^|\.)github\.com$/i;
 
+// --- Normalize URLs for deduplication ---
+function normalizeUrlForDedup(url) {
+  try {
+    const u = new URL(url);
+    if (/docs\.google\.com/i.test(u.hostname)) {
+      // Extract document ID from path: /document/d/DOC_ID/...
+      const match = u.pathname.match(/\/document\/d\/([^\/]+)/);
+      if (match) {
+        return `https://docs.google.com/document/d/${match[1]}`;
+      }
+      // Similar for sheets and slides
+      const sheetMatch = u.pathname.match(/\/spreadsheets\/d\/([^\/]+)/);
+      if (sheetMatch) {
+        return `https://docs.google.com/spreadsheets/d/${sheetMatch[1]}`;
+      }
+      const slideMatch = u.pathname.match(/\/presentation\/d\/([^\/]+)/);
+      if (slideMatch) {
+        return `https://docs.google.com/presentation/d/${slideMatch[1]}`;
+      }
+    } else if (/github\.com/i.test(u.hostname)) {
+      // Normalize GitHub URLs: github.com/owner/repo
+      const parts = u.pathname.split('/').filter(p => p);
+      if (parts.length >= 2) {
+        return `https://github.com/${parts[0]}/${parts[1]}`;
+      }
+    }
+    // For other URLs, remove query and fragment
+    return `${u.protocol}//${u.hostname}${u.pathname}`;
+  } catch {
+    return url; // Fallback to original
+  }
+}
+
 const normalizeItem = (url, title = "", extractedContent = null) => {
   try {
     const u = new URL(url);
@@ -50,8 +83,17 @@ const normalizeItem = (url, title = "", extractedContent = null) => {
 };
 
 const dedupeByUrl = (arr) => {
-  const seen = new Set(); const out = [];
-  for (const x of arr) if (x && !seen.has(x.url)) { seen.add(x.url); out.push(x); }
+  const seen = new Set();
+  const out = [];
+  for (const x of arr) {
+    if (x && x.url) {
+      const normalized = normalizeUrlForDedup(x.url);
+      if (!seen.has(normalized)) {
+        seen.add(normalized);
+        out.push(x);
+      }
+    }
+  }
   return out;
 };
 
@@ -237,9 +279,14 @@ async function extractContentAsync(tabId, url) {
     }
     
     if (indexCache) {
-      // Update in-memory cache immediately (fast!)
-      const itemIndex = indexCache.findIndex(item => item.url === url);
+      // Check by normalized URL, not exact URL
+      const normalizedUrl = normalizeUrlForDedup(url);
+      const itemIndex = indexCache.findIndex(item => 
+        normalizeUrlForDedup(item.url) === normalizedUrl
+      );
+      
       if (itemIndex >= 0) {
+        // Update existing item
         indexCache[itemIndex].content = content.content || '';
         indexCache[itemIndex].headings = content.headings || '';
         if (content.title && content.title.trim() && content.title !== 'Untitled document') {
@@ -348,12 +395,23 @@ chrome.omnibox.onInputChanged.addListener(async (text, suggest) => {
 
   scored.sort((a, b) => b.score - a.score);
 
+  // Deduplicate suggestions by normalized URL
+  const seenUrls = new Set();
+  const uniqueScored = [];
+  for (const { item, score } of scored) {
+    const normalized = normalizeUrlForDedup(item.url);
+    if (!seenUrls.has(normalized)) {
+      seenUrls.add(normalized);
+      uniqueScored.push({ item, score });
+    }
+  }
+
   // Add Docs/GitHub suggestions, maintaining max 6 total
   const maxSuggestions = 6;
   const remainingSlots = maxSuggestions - suggestions.length;
   
   if (remainingSlots > 0) {
-    const docsGithubSuggestions = scored.slice(0, remainingSlots).map(({ item }) => ({
+    const docsGithubSuggestions = uniqueScored.slice(0, remainingSlots).map(({ item }) => ({
       content: item.url,
       description: `${item.kind}: ${escapeForOmnibox(item.title)} — <url>${escapeForOmnibox(item.url)}</url>`
     }));
@@ -412,9 +470,20 @@ chrome.omnibox.onInputEntered.addListener(async (text, disposition) => {
 
       scored.sort((a, b) => b.score - a.score);
       
+      // Deduplicate by normalized URL
+      const seenUrls = new Set();
+      const uniqueScored = [];
+      for (const { item, score } of scored) {
+        const normalized = normalizeUrlForDedup(item.url);
+        if (!seenUrls.has(normalized)) {
+          seenUrls.add(normalized);
+          uniqueScored.push({ item, score });
+        }
+      }
+      
       // Use first suggestion if available, otherwise fall back to Google search
-      url = scored.length > 0 
-        ? scored[0].item.url 
+      url = uniqueScored.length > 0 
+        ? uniqueScored[0].item.url 
         : `https://www.google.com/search?q=${encodeURIComponent(text)}`;
     }
   }
