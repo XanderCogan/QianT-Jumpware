@@ -10,8 +10,9 @@ const fuzzyScore = (q, t) => {
   return -jumps - t.length * 0.001;            // fewer jumps + shorter targets rank higher
 };
 
-// --- restrict to Docs + GitHub only ---
+// --- restrict to Docs + GitHub + Chrome URLs ---
 const HOST_ALLOW = /(^|\.)docs\.google\.com$|(^|\.)github\.com$/i;
+const isChromeUrl = (url) => url.startsWith('chrome://') || url.startsWith('chrome-extension://');
 
 // --- Normalize URLs for deduplication ---
 function normalizeUrlForDedup(url) {
@@ -48,6 +49,20 @@ function normalizeUrlForDedup(url) {
 
 const normalizeItem = (url, title = "", extractedContent = null) => {
   try {
+    // Allow chrome:// URLs (no hostname check needed)
+    if (isChromeUrl(url)) {
+      const finalTitle = extractedContent?.title || title || url;
+      return {
+        url: url,
+        title: finalTitle && finalTitle.trim() ? finalTitle : url,
+        host: 'chrome://',
+        kind: 'Chrome',
+        content: extractedContent?.content || '',
+        headings: extractedContent?.headings || '',
+        extractedAt: extractedContent?.extractedAt || null
+      };
+    }
+    
     const u = new URL(url);
     if (!HOST_ALLOW.test(u.hostname)) return null;
 
@@ -320,9 +335,17 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   // Extract content when page is fully loaded
   if (changeInfo.status === 'complete' && tab.url) {
     try {
-      const u = new URL(tab.url);
-      if (HOST_ALLOW.test(u.hostname)) {
+      // Allow chrome:// URLs and regular allowed hosts
+      if (isChromeUrl(tab.url) || (() => {
+        try {
+          const u = new URL(tab.url);
+          return HOST_ALLOW.test(u.hostname);
+        } catch {
+          return false;
+        }
+      })()) {
         // Reduced delay - extract after minimal wait for page render
+        // Note: chrome:// URLs won't have content scripts, so extractContentAsync will gracefully fail
         setTimeout(() => extractContentAsync(tabId, tab.url), 200);
       }
     } catch (e) {
@@ -349,6 +372,15 @@ chrome.omnibox.onInputChanged.addListener(async (text, suggest) => {
   
   const suggestions = [];
   const q = text.trim().toLowerCase();
+  
+  // If query is a full URL, prioritize showing it as first suggestion
+  if (isFullUrlQuery(text)) {
+    const normalizedUrl = normalizeUrlQuery(text);
+    suggestions.push({
+      content: normalizedUrl,
+      description: `Open URL: <url>${escapeForOmnibox(normalizedUrl)}</url>`
+    });
+  }
 
   // 1. OTP Gmail suggestion (highest priority if detected)
   // Always show as first suggestion when OTP screen is detected
@@ -384,13 +416,21 @@ chrome.omnibox.onInputChanged.addListener(async (text, suggest) => {
       })
     : idx;
   
+  // Get currently open URLs for cluster boost calculation
+  const openUrls = await getOpenNormalizedUrls();
+  
   // Only include full content in search for longer queries (3+ chars)
   // For short queries, just search title/url/kind for speed
   const scored = quickFilter.map(item => {
     const hay = q.length >= 3 
       ? `${item.title} ${item.url} ${item.kind} ${item.content || ''} ${item.headings || ''}`
       : `${item.title} ${item.url} ${item.kind}`;
-    return { item, score: fuzzyScore(q, hay) };
+    const baseScore = fuzzyScore(q, hay);
+    
+    // Apply cluster boost
+    const clusterBoost = calculateClusterBoost(item.url, openUrls);
+    
+    return { item, score: baseScore + clusterBoost };
   }).filter(x => x.score !== -Infinity);
 
   scored.sort((a, b) => b.score - a.score);
@@ -427,8 +467,12 @@ chrome.omnibox.onInputEntered.addListener(async (text, disposition) => {
   let url;
   
   // If text is already a URL (user selected a suggestion), use it
-  if (/^https?:\/\//i.test(text)) {
+  if (/^https?:\/\//i.test(text) || /^chrome:\/\//i.test(text) || /^chrome-extension:\/\//i.test(text)) {
     url = text;
+  } 
+  // If query is a full URL, open it directly (override suggestions)
+  else if (isFullUrlQuery(text)) {
+    url = normalizeUrlQuery(text);
   } else {
     // Get fresh snapshot to check for OTP Gmail or on-screen links
     const snapshot = await requestScreenSnapshot();
@@ -460,12 +504,20 @@ chrome.omnibox.onInputEntered.addListener(async (text, disposition) => {
           })
         : idx;
       
+      // Get currently open URLs for cluster boost calculation
+      const openUrls = await getOpenNormalizedUrls();
+      
       const scored = quickFilter.map(item => {
         // Include content for longer queries
         const hay = q.length >= 3 
           ? `${item.title} ${item.url} ${item.kind} ${item.content || ''} ${item.headings || ''}`
           : `${item.title} ${item.url} ${item.kind}`;
-        return { item, score: fuzzyScore(q, hay) };
+        const baseScore = fuzzyScore(q, hay);
+        
+        // Apply cluster boost
+        const clusterBoost = calculateClusterBoost(item.url, openUrls);
+        
+        return { item, score: baseScore + clusterBoost };
       }).filter(x => x.score !== -Infinity);
 
       scored.sort((a, b) => b.score - a.score);
@@ -493,6 +545,30 @@ chrome.omnibox.onInputEntered.addListener(async (text, disposition) => {
   else chrome.tabs.create({ url, active: false });
 });
 
+// --- Detect if query is a full URL ---
+function isFullUrlQuery(query) {
+  const trimmed = query.trim();
+  // Contains protocol (://)
+  if (trimmed.includes('://')) return true;
+  // Matches pattern like domain.com, domain.org, etc. (has TLD)
+  // Pattern: starts with alphanumeric, has dots, ends with TLD (2+ chars) optionally followed by / or end
+  const urlPattern = /^[a-z0-9.-]+\.[a-z]{2,}(\/|$|\s)/i;
+  if (urlPattern.test(trimmed)) return true;
+  return false;
+}
+
+// --- Normalize URL query to proper URL format ---
+function normalizeUrlQuery(query) {
+  const trimmed = query.trim();
+  // If already has protocol, return as-is
+  if (trimmed.includes('://')) return trimmed;
+  // If looks like a domain, add https://
+  if (/^[a-z0-9.-]+\.[a-z]{2,}/i.test(trimmed)) {
+    return `https://${trimmed}`;
+  }
+  return trimmed;
+}
+
 // utility: minimal escaping so titles/urls render safely in suggestions
 function escapeForOmnibox(s) {
   return (s || "")
@@ -500,6 +576,180 @@ function escapeForOmnibox(s) {
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;");
 }
+
+// --- Link Clustering: Co-occurrence Tracking ---
+let coOccurrenceData = null;
+const CO_OCCURRENCE_SNAPSHOT_INTERVAL = 45000; // 45 seconds
+let lastSnapshotTime = 0;
+let snapshotTimeout = null;
+const CLUSTER_BOOST_BASE = 50; // Base boost multiplier
+
+// Load co-occurrence data from storage
+async function loadCoOccurrenceData() {
+  const { urlCoOccurrence } = await chrome.storage.local.get(['urlCoOccurrence']);
+  if (urlCoOccurrence) {
+    coOccurrenceData = urlCoOccurrence;
+  } else {
+    coOccurrenceData = {};
+  }
+}
+
+// Save co-occurrence data to storage
+async function saveCoOccurrenceData() {
+  await chrome.storage.local.set({ urlCoOccurrence: coOccurrenceData });
+}
+
+// Record co-occurrence of URLs
+function recordCoOccurrence(urls) {
+  if (!coOccurrenceData) return;
+  
+  // Normalize all URLs
+  const normalizedUrls = urls
+    .map(url => normalizeUrlForDedup(url))
+    .filter(url => url && url.length > 0);
+  
+  // Record pairwise co-occurrences
+  for (let i = 0; i < normalizedUrls.length; i++) {
+    const url1 = normalizedUrls[i];
+    if (!coOccurrenceData[url1]) {
+      coOccurrenceData[url1] = {};
+    }
+    
+    for (let j = i + 1; j < normalizedUrls.length; j++) {
+      const url2 = normalizedUrls[j];
+      if (!coOccurrenceData[url2]) {
+        coOccurrenceData[url2] = {};
+      }
+      
+      // Increment co-occurrence count for both directions
+      coOccurrenceData[url1][url2] = (coOccurrenceData[url1][url2] || 0) + 1;
+      coOccurrenceData[url2][url1] = (coOccurrenceData[url2][url1] || 0) + 1;
+    }
+  }
+  
+  // Save periodically (debounced)
+  if (snapshotTimeout) clearTimeout(snapshotTimeout);
+  snapshotTimeout = setTimeout(() => {
+    saveCoOccurrenceData().catch(e => console.log('[Jumpware] Error saving co-occurrence data:', e));
+  }, 5000); // Save 5 seconds after last update
+}
+
+// Get currently open normalized URLs
+async function getOpenNormalizedUrls() {
+  try {
+    const tabs = await chrome.tabs.query({});
+    return tabs
+      .map(tab => tab.url)
+      .filter(url => url)
+      .map(url => normalizeUrlForDedup(url))
+      .filter(url => url && url.length > 0);
+  } catch (e) {
+    console.log('[Jumpware] Error getting open URLs:', e);
+    return [];
+  }
+}
+
+// Calculate cluster boost for a URL based on currently open tabs
+function calculateClusterBoost(suggestionUrl, openUrls) {
+  if (!coOccurrenceData || !openUrls || openUrls.length === 0) return 0;
+  
+  const normalizedSuggestion = normalizeUrlForDedup(suggestionUrl);
+  const coOccurringUrls = coOccurrenceData[normalizedSuggestion];
+  
+  if (!coOccurringUrls || Object.keys(coOccurringUrls).length === 0) return 0;
+  
+  // Find which co-occurring URLs are currently open
+  const openCoOccurringUrls = [];
+  let totalFrequency = 0;
+  let openFrequency = 0;
+  
+  for (const [coUrl, count] of Object.entries(coOccurringUrls)) {
+    totalFrequency += count;
+    if (openUrls.includes(coUrl)) {
+      openCoOccurringUrls.push(coUrl);
+      openFrequency += count;
+    }
+  }
+  
+  if (openCoOccurringUrls.length === 0) return 0;
+  
+  // Calculate cluster size (number of unique co-occurring URLs)
+  const clusterSize = Object.keys(coOccurringUrls).length;
+  
+  // Calculate proportional boost: (openCount / clusterSize) * frequencyWeight
+  const openRatio = openCoOccurringUrls.length / clusterSize;
+  
+  // Frequency weight: how often the open URLs co-occur with this suggestion
+  // relative to all co-occurrences
+  const frequencyWeight = totalFrequency > 0 ? openFrequency / totalFrequency : 0;
+  
+  // Boost formula: proportional to cluster participation and frequency
+  const boost = openRatio * frequencyWeight * CLUSTER_BOOST_BASE;
+  
+  return boost;
+}
+
+// Snapshot currently open tabs and record co-occurrences
+async function snapshotOpenTabs() {
+  try {
+    const tabs = await chrome.tabs.query({});
+    const urls = tabs
+      .map(tab => tab.url)
+      .filter(url => url && (isChromeUrl(url) || (() => {
+        try {
+          const u = new URL(url);
+          return HOST_ALLOW.test(u.hostname);
+        } catch {
+          return false;
+        }
+      })()));
+    
+    if (urls.length > 1) {
+      recordCoOccurrence(urls);
+    }
+    
+    lastSnapshotTime = Date.now();
+  } catch (e) {
+    console.log('[Jumpware] Error snapshotting tabs:', e);
+  }
+}
+
+// Periodic snapshot scheduler
+function scheduleNextSnapshot() {
+  const timeSinceLastSnapshot = Date.now() - lastSnapshotTime;
+  const delay = Math.max(0, CO_OCCURRENCE_SNAPSHOT_INTERVAL - timeSinceLastSnapshot);
+  
+  setTimeout(async () => {
+    await snapshotOpenTabs();
+    scheduleNextSnapshot();
+  }, delay);
+}
+
+// Track tab changes for immediate co-occurrence updates
+let tabChangeTimeout = null;
+chrome.tabs.onCreated.addListener(async () => {
+  // Debounce: snapshot after 2 seconds of tab activity
+  if (tabChangeTimeout) clearTimeout(tabChangeTimeout);
+  tabChangeTimeout = setTimeout(async () => {
+    await snapshotOpenTabs();
+  }, 2000);
+});
+
+chrome.tabs.onRemoved.addListener(async () => {
+  // Debounce: snapshot after 2 seconds of tab activity
+  if (tabChangeTimeout) clearTimeout(tabChangeTimeout);
+  tabChangeTimeout = setTimeout(async () => {
+    await snapshotOpenTabs();
+  }, 2000);
+});
+
+// Initialize co-occurrence tracking
+loadCoOccurrenceData().then(() => {
+  // Take initial snapshot
+  snapshotOpenTabs();
+  // Schedule periodic snapshots
+  scheduleNextSnapshot();
+});
 
 // build initial index on install/activate and load into memory
 loadIndexToMemory();
