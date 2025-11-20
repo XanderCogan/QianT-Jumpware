@@ -1,18 +1,140 @@
-// --- tiny fuzzy subsequence matcher ---
+// --- word-based fuzzy subsequence matcher ---
+// Each word in the query must match as a subsequence in the target
+// Extra characters that don't match are penalized
+// Words that require too many jumps relative to their length are rejected
 const fuzzyScore = (q, t) => {
   q = q.toLowerCase().trim(); t = t.toLowerCase();
   if (!q) return -9999;
-  let qi = 0, jumps = 0;
-  for (let i = 0; i < t.length && qi < q.length; i++) {
-    if (t[i] === q[qi]) qi++; else jumps++;
+  
+  // Split query into words
+  const words = q.split(/\s+/).filter(w => w.length > 0);
+  if (words.length === 0) return -9999;
+  
+  let totalJumps = 0;
+  
+  // For each word, find it as a subsequence anywhere in the target
+  for (const word of words) {
+    let wordMatched = false;
+    let bestWordJumps = Infinity;
+    
+    // Try to find this word as a subsequence starting from each position
+    for (let startPos = 0; startPos < t.length; startPos++) {
+      let wordJumps = 0;
+      let wi = 0; // Index in word
+      
+      for (let i = startPos; i < t.length && wi < word.length; i++) {
+        if (t[i] === word[wi]) {
+          wi++;
+          if (wi === word.length) {
+            // Word fully matched
+            wordMatched = true;
+            bestWordJumps = Math.min(bestWordJumps, wordJumps);
+            break; // Found match starting at startPos, try next start position for better match
+          }
+        } else {
+          wordJumps++;
+        }
+      }
+    }
+    
+    // If any word doesn't match, reject the entire match
+    if (!wordMatched) {
+      // Debug: log when word doesn't match
+      console.log(`[Jumpware] Word "${word}" not found in target`);
+      return -Infinity;
+    }
+    
+    // Reject matches where jumps are too high relative to word length
+    // Stricter threshold: jumps > word.length * 1.5 for better precision
+    // This prevents matching "somer" or "ian" across scattered characters in long content
+    // For very short words (<=3 chars), be even stricter (1.0x) to prevent false matches
+    const jumpThreshold = word.length <= 3 ? word.length * 1.0 : word.length * 1.5;
+    if (bestWordJumps > jumpThreshold) {
+      console.log(`[Jumpware] Word "${word}" matched but with too many jumps: ${bestWordJumps} (threshold: ${jumpThreshold}, word length: ${word.length})`);
+      return -Infinity;
+    }
+    
+    totalJumps += bestWordJumps;
   }
-  if (qi < q.length) return -Infinity;         // query not found as subsequence
-  return -jumps - t.length * 0.001;            // fewer jumps + shorter targets rank higher
+  
+  // Calculate penalty for extra characters in query that don't contribute to matches
+  // This is the total query length minus the sum of matched word lengths
+  const matchedChars = words.reduce((sum, w) => sum + w.length, 0);
+  const extraCharPenalty = q.length - matchedChars;
+  
+  // Return score: fewer jumps + shorter targets + fewer extra chars rank higher
+  const score = -totalJumps - t.length * 0.001 - extraCharPenalty * 0.1;
+  
+  // Debug logging for problematic queries
+  if (q.includes('somerholder') || q.includes('sprunkus') || q.includes('somer')) {
+    console.log(`[Jumpware] Query: "${q}", Score: ${score}, Jumps: ${totalJumps}, Target length: ${t.length}, Target preview: "${t.substring(0, 100)}..."`);
+  }
+  
+  return score;
 };
 
 // --- restrict to Docs + GitHub + Chrome URLs ---
 const HOST_ALLOW = /(^|\.)docs\.google\.com$|(^|\.)github\.com$/i;
 const isChromeUrl = (url) => url.startsWith('chrome://') || url.startsWith('chrome-extension://');
+
+// --- Match quality threshold ---
+// Matches with scores below this threshold are considered too poor and rejected
+// Higher threshold (less negative) = stricter matching
+// This ensures queries like "sprunkus" or "ian somer" fall through to Google
+const MATCH_QUALITY_THRESHOLD = -15;
+
+// --- Calculate weighted text score from separate field scores ---
+// Weights: title (1.5), content (1.0), headings (0.8), url (0.5), kind (0.3)
+function calculateWeightedTextScore(query, item) {
+  const q = query.toLowerCase().trim();
+  if (!q) return -9999;
+  
+  // Calculate individual field scores
+  const titleScore = fuzzyScore(q, (item.title || '').toLowerCase());
+  const urlScore = fuzzyScore(q, (item.url || '').toLowerCase());
+  const kindScore = fuzzyScore(q, (item.kind || '').toLowerCase());
+  
+  // For queries >= 3 chars, include content and headings
+  let contentScore = -9999;
+  let headingsScore = -9999;
+  
+  if (q.length >= 3) {
+    contentScore = fuzzyScore(q, (item.content || '').toLowerCase());
+    headingsScore = fuzzyScore(q, (item.headings || '').toLowerCase());
+  }
+  
+  // Check if any field has a valid match (not -Infinity and not -9999)
+  // -Infinity means the query doesn't match that field at all
+  // -9999 means the query was empty or invalid
+  const allScores = [titleScore, urlScore, kindScore];
+  if (q.length >= 3) {
+    allScores.push(contentScore, headingsScore);
+  }
+  
+  const hasValidMatch = allScores.some(score => score !== -Infinity && score !== -9999);
+  
+  if (!hasValidMatch) {
+    return -Infinity;
+  }
+  
+  // Apply weights and combine scores
+  // Fields that return -Infinity don't match, so contribute 0 to the weighted sum
+  // Fields that return -9999 (not searched) also contribute 0
+  const safeTitleScore = (titleScore === -Infinity || titleScore === -9999) ? 0 : titleScore;
+  const safeUrlScore = (urlScore === -Infinity || urlScore === -9999) ? 0 : urlScore;
+  const safeKindScore = (kindScore === -Infinity || kindScore === -9999) ? 0 : kindScore;
+  const safeContentScore = (contentScore === -Infinity || contentScore === -9999) ? 0 : contentScore;
+  const safeHeadingsScore = (headingsScore === -Infinity || headingsScore === -9999) ? 0 : headingsScore;
+  
+  // Weighted combination
+  const textScore = (safeTitleScore * 1.5) + 
+                    (safeContentScore * 1.0) + 
+                    (safeHeadingsScore * 0.8) + 
+                    (safeUrlScore * 0.5) + 
+                    (safeKindScore * 0.3);
+  
+  return textScore;
+}
 
 // --- Normalize URLs for deduplication ---
 function normalizeUrlForDedup(url) {
@@ -419,18 +541,15 @@ chrome.omnibox.onInputChanged.addListener(async (text, suggest) => {
   // Get currently open URLs for cluster boost calculation
   const openUrls = await getOpenNormalizedUrls();
   
-  // Only include full content in search for longer queries (3+ chars)
-  // For short queries, just search title/url/kind for speed
+  // Calculate weighted text scores with separate field scoring
+  // Weights: title (1.5), content (1.0), headings (0.8), url (0.5), kind (0.3)
   const scored = quickFilter.map(item => {
-    const hay = q.length >= 3 
-      ? `${item.title} ${item.url} ${item.kind} ${item.content || ''} ${item.headings || ''}`
-      : `${item.title} ${item.url} ${item.kind}`;
-    const baseScore = fuzzyScore(q, hay);
+    const textScore = calculateWeightedTextScore(q, item);
     
     // Apply cluster boost
     const clusterBoost = calculateClusterBoost(item.url, openUrls);
     
-    return { item, score: baseScore + clusterBoost };
+    return { item, score: textScore + clusterBoost };
   }).filter(x => x.score !== -Infinity);
 
   scored.sort((a, b) => b.score - a.score);
@@ -447,15 +566,34 @@ chrome.omnibox.onInputChanged.addListener(async (text, suggest) => {
   }
 
   // Add Docs/GitHub suggestions, maintaining max 6 total
+  // Only add suggestions if the best match meets quality threshold
   const maxSuggestions = 6;
   const remainingSlots = maxSuggestions - suggestions.length;
   
-  if (remainingSlots > 0) {
-    const docsGithubSuggestions = uniqueScored.slice(0, remainingSlots).map(({ item }) => ({
-      content: item.url,
-      description: `${item.kind}: ${escapeForOmnibox(item.title)} — <url>${escapeForOmnibox(item.url)}</url>`
-    }));
-    suggestions.push(...docsGithubSuggestions);
+  let hasGoodMatch = false;
+  if (remainingSlots > 0 && uniqueScored.length > 0) {
+    // Check if best match meets quality threshold
+    const bestMatch = uniqueScored[0];
+    if (bestMatch.score >= MATCH_QUALITY_THRESHOLD) {
+      hasGoodMatch = true;
+      const docsGithubSuggestions = uniqueScored.slice(0, remainingSlots).map(({ item }) => ({
+        content: item.url,
+        description: `${item.kind}: ${escapeForOmnibox(item.title)} — <url>${escapeForOmnibox(item.url)}</url>`
+      }));
+      suggestions.push(...docsGithubSuggestions);
+    } else {
+      // Best match is too poor, don't show any suggestions
+      console.log(`[Jumpware] Best match score ${bestMatch.score} below threshold ${MATCH_QUALITY_THRESHOLD}, not showing suggestions`);
+    }
+  }
+  
+  // If no good matches found and user has typed something, suggest Google search
+  if (!hasGoodMatch && q.length > 0 && suggestions.length < maxSuggestions) {
+    const googleSearchUrl = `https://www.google.com/search?q=${encodeURIComponent(text.trim())}`;
+    suggestions.push({
+      content: googleSearchUrl,
+      description: `Search Google: ${escapeForOmnibox(text.trim())} — <url>${escapeForOmnibox(googleSearchUrl)}</url>`
+    });
   }
 
   // Limit to max 6 suggestions
@@ -508,16 +646,14 @@ chrome.omnibox.onInputEntered.addListener(async (text, disposition) => {
       const openUrls = await getOpenNormalizedUrls();
       
       const scored = quickFilter.map(item => {
-        // Include content for longer queries
-        const hay = q.length >= 3 
-          ? `${item.title} ${item.url} ${item.kind} ${item.content || ''} ${item.headings || ''}`
-          : `${item.title} ${item.url} ${item.kind}`;
-        const baseScore = fuzzyScore(q, hay);
+        // Calculate weighted text scores with separate field scoring
+        // Weights: title (1.5), content (1.0), headings (0.8), url (0.5), kind (0.3)
+        const textScore = calculateWeightedTextScore(q, item);
         
         // Apply cluster boost
         const clusterBoost = calculateClusterBoost(item.url, openUrls);
         
-        return { item, score: baseScore + clusterBoost };
+        return { item, score: textScore + clusterBoost };
       }).filter(x => x.score !== -Infinity);
 
       scored.sort((a, b) => b.score - a.score);
@@ -533,10 +669,16 @@ chrome.omnibox.onInputEntered.addListener(async (text, disposition) => {
         }
       }
       
-      // Use first suggestion if available, otherwise fall back to Google search
-      url = uniqueScored.length > 0 
-        ? uniqueScored[0].item.url 
-        : `https://www.google.com/search?q=${encodeURIComponent(text)}`;
+      // Use first suggestion if available and meets quality threshold, otherwise fall back to Google search
+      if (uniqueScored.length > 0 && uniqueScored[0].score >= MATCH_QUALITY_THRESHOLD) {
+        url = uniqueScored[0].item.url;
+      } else {
+        // No good matches, fall through to Google search
+        if (uniqueScored.length > 0) {
+          console.log(`[Jumpware] Best match score ${uniqueScored[0].score} below threshold ${MATCH_QUALITY_THRESHOLD}, falling through to Google`);
+        }
+        url = `https://www.google.com/search?q=${encodeURIComponent(text)}`;
+      }
     }
   }
 
